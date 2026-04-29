@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import getpass
 import json
 import math
 import os
@@ -29,6 +30,75 @@ def load_local_env_file() -> None:
         if not key:
             continue
         os.environ.setdefault(key, value.strip())
+
+
+def load_home_config(config_dirname: str) -> dict:
+    """
+    Loads ~/.config/<config_dirname>/config.json if present.
+    This allows sharing a public skill without committing secrets.
+    """
+    cfg_path = Path.home() / ".config" / config_dirname / "config.json"
+    if not cfg_path.exists():
+        return {}
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON in {cfg_path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Expected object JSON in {cfg_path}.")
+    return data
+
+
+def config_get_str(cfg: dict, *keys: str) -> str | None:
+    for k in keys:
+        v = cfg.get(k)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            v = v.strip()
+        else:
+            v = str(v).strip()
+        if v:
+            return v
+    return None
+
+
+def prompt_value(label: str, is_secret: bool) -> str:
+    if is_secret:
+        return getpass.getpass(f"Enter {label}: ").strip()
+    return input(f"Enter {label}: ").strip()
+
+
+def env_nonempty(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value if value else None
+
+
+def resolve_credential(
+    *,
+    env_name: str,
+    config: dict,
+    config_keys: tuple[str, ...],
+    prompt_missing: bool,
+    prompt_label: str,
+    is_secret: bool,
+    default: str | None = None,
+) -> str | None:
+    env_value = env_nonempty(env_name)
+    if env_value:
+        return env_value
+
+    cfg_value = config_get_str(config, *config_keys)
+    if cfg_value:
+        return cfg_value
+
+    if prompt_missing:
+        return prompt_value(prompt_label, is_secret=is_secret)
+
+    return default
 
 # Aligns with Tibber developer examples (viewer.homes + subscription + priceInfo).
 # today/tomorrow are kept for hourly upcoming prices used by prices/optimize.
@@ -441,6 +511,11 @@ def build_parser():
 
     s1 = sub.add_parser("prices", help="Show upcoming hourly spot prices.")
     s1.add_argument("--hours", type=int, default=24)
+    s1.add_argument(
+        "--prompt-missing-secrets",
+        action="store_true",
+        help="Prompt for missing credentials (interactive mode).",
+    )
 
     s2 = sub.add_parser("optimize", help="Find cheapest contiguous time window.")
     s2.add_argument("--duration-hours", type=int)
@@ -448,10 +523,20 @@ def build_parser():
     s2.add_argument("--power-kw", type=float)
     s2.add_argument("--window-start")
     s2.add_argument("--window-end")
+    s2.add_argument(
+        "--prompt-missing-secrets",
+        action="store_true",
+        help="Prompt for missing credentials (interactive mode).",
+    )
 
     s3 = sub.add_parser("anomalies", help="Detect hourly consumption anomalies.")
     s3.add_argument("--lookback-hours", type=int, default=168)
     s3.add_argument("--sigma", type=float, default=2.5)
+    s3.add_argument(
+        "--prompt-missing-secrets",
+        action="store_true",
+        help="Prompt for missing credentials (interactive mode).",
+    )
 
     s4 = sub.add_parser("control", help="Trigger commands from current price thresholds.")
     s4.add_argument("--price-below", type=float)
@@ -459,6 +544,11 @@ def build_parser():
     s4.add_argument("--on-command")
     s4.add_argument("--off-command")
     s4.add_argument("--execute", action="store_true")
+    s4.add_argument(
+        "--prompt-missing-secrets",
+        action="store_true",
+        help="Prompt for missing credentials (interactive mode).",
+    )
 
     return p
 
@@ -467,10 +557,37 @@ def main():
     load_local_env_file()
     parser = build_parser()
     args = parser.parse_args()
-    token = (os.environ.get("TIBBER_ACCESS_TOKEN") or "").strip()
-    home_id = (os.environ.get("TIBBER_HOME_ID") or "").strip() or None
+
+    prompt_missing = bool(getattr(args, "prompt_missing_secrets", False))
+    config = load_home_config("tibber-energy")
+
+    token = resolve_credential(
+        env_name="TIBBER_ACCESS_TOKEN",
+        config=config,
+        config_keys=("access_token", "TIBBER_ACCESS_TOKEN"),
+        prompt_missing=prompt_missing,
+        prompt_label="TIBBER_ACCESS_TOKEN",
+        is_secret=True,
+        default=None,
+    )
+    home_id = resolve_credential(
+        env_name="TIBBER_HOME_ID",
+        config=config,
+        config_keys=("home_id", "TIBBER_HOME_ID"),
+        prompt_missing=False,
+        prompt_label="TIBBER_HOME_ID",
+        is_secret=False,
+        default=None,
+    )
+
     if not token:
-        raise RuntimeError("Missing TIBBER_ACCESS_TOKEN environment variable.")
+        cfg_path = Path.home() / ".config" / "tibber-energy" / "config.json"
+        raise RuntimeError(
+            "Missing Tibber credentials. Set TIBBER_ACCESS_TOKEN as an environment variable, "
+            f"or create {cfg_path}. "
+            "To be prompted interactively, rerun with --prompt-missing-secrets."
+        )
+
     if args.cmd == "prices":
         command_prices(args, token, home_id)
     elif args.cmd == "optimize":
